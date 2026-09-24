@@ -8,6 +8,8 @@ import joblib
 from sklearn.calibration import CalibratedClassifierCV
 import nibabel as nib
 import os
+import json
+import subprocess
 import vtkmodules.all as vtk
 import sys
 import pandas as pd
@@ -45,6 +47,54 @@ from vtkmodules.vtkRenderingCore import (
 from vtkmodules.vtkRenderingVolume import vtkGPUVolumeRayCastMapper
 from PyQt5.QtGui import *
 from PyQt5.QtCore import *
+
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_DIR = os.path.dirname(APP_DIR)
+VESSEL_FEATURE_SCRIPT = os.path.join(APP_DIR, 'compute_vessel_features.py')
+MODEL_FEATURES = ['MIA_12', 'maximum area_3', 'tortuosity_3', 'curvature_2', 'curvature_3']
+
+
+def run_vessel_feature_pipeline(mask_path, output_dir):
+    configured_python = os.environ.get('VESSEL_FEATURE_PYTHON')
+    bundled_python = os.path.join(
+        PROJECT_DIR, '.conda-vessel', 'python.exe' if os.name == 'nt' else os.path.join('bin', 'python')
+    )
+    python_executable = configured_python or (bundled_python if os.path.isfile(bundled_python) else sys.executable)
+    if not os.path.isfile(VESSEL_FEATURE_SCRIPT):
+        raise RuntimeError("Vessel feature script was not found: " + VESSEL_FEATURE_SCRIPT)
+
+    command = [
+        python_executable, VESSEL_FEATURE_SCRIPT,
+        '--mask', os.path.abspath(mask_path),
+        '--out', os.path.abspath(output_dir),
+        '--labels', '1', '2', '3',
+        '--workers', '1',
+        '--reuse',
+    ]
+    startupinfo = None
+    if os.name == 'nt':
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    result = subprocess.run(
+        command, cwd=APP_DIR, capture_output=True, text=True, startupinfo=startupinfo
+    )
+    if result.returncode != 0:
+        details = (result.stderr or result.stdout or 'Unknown vessel feature error').strip()
+        raise RuntimeError(details[-2000:])
+
+    case = os.path.basename(mask_path)
+    for suffix in ('.nii.gz', '.nii'):
+        if case.endswith(suffix):
+            case = case[:-len(suffix)]
+            break
+    if case.endswith('_vascular'):
+        case = case[:-len('_vascular')]
+    json_path = os.path.join(output_dir, case, case + '_vessel_features.json')
+    if not os.path.isfile(json_path):
+        raise RuntimeError("Vessel feature result was not created: " + json_path)
+    with open(json_path, encoding='utf-8') as result_file:
+        return json.load(result_file)
+
 gpu_id = "3"
 os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -76,7 +126,7 @@ class MyWindow1(QMainWindow, Ui_MainWindow):
         self.resultprint = None
         self.flag = False
         self.face_flage = 0
-        self.model = joblib.load(r'Calibra_model.joblib')
+        self.model = joblib.load(os.path.join(APP_DIR, 'Calibra_model.joblib'))
         self.view1.setMouseTracking(True)
         self.view2.setMouseTracking(True)
         self.view3.setMouseTracking(True)
@@ -109,6 +159,9 @@ class MyWindow1(QMainWindow, Ui_MainWindow):
         self.volume_old = None
         self.mask_path = None
         self.livermask_path = None
+        self.vasmask_path = None
+        self.vessel_model_features = None
+        self.vessel_features_output_dir = None
         self.scale_ratio = 1
 
         self.scene1.mouseDoubleClickEvent = self.pointselect1
@@ -894,25 +947,45 @@ class MyWindow1(QMainWindow, Ui_MainWindow):
     def cal_vascular(self):
         self.statusbar.showMessage("Calculate the macroscopic features of vascular")
         self.show_message_compute_volume()
-        if os.path.exists(self.filename.split('.nii.gz')[0] + '_vascular.nii.gz') == False:
-            self.get_tumormask()
-        elif os.path.exists(self.filename.split('.nii.gz')[0] + 'vascular.nii.gz') == True:
-            vasmask = itk.ReadImage(self.filename.split('.nii.gz')[0] + 'vascular.nii.gz')
-            self.vas_mask = itk.GetArrayFromImage(vasmask)
+        try:
+            mask_path = self.vasmask_path
+            if not mask_path or not os.path.isfile(mask_path):
+                if not self.filename:
+                    raise RuntimeError("Please load a CT image and its vascular mask first")
+                image_stem = self.filename[:-7] if self.filename.endswith('.nii.gz') else os.path.splitext(self.filename)[0]
+                mask_path = image_stem + '_vascular.nii.gz'
+            if not os.path.isfile(mask_path):
+                self.get_vascular()
+                mask_path = self.vasmask_path
+            if not mask_path or not os.path.isfile(mask_path):
+                raise RuntimeError("Vascular mask was not found")
 
-        # self.area_pv = 158.5677561
-        # self.area_sv = 102.2732593
-        # self.area_lpv = 736.7918011
-        # self.tortuosity_lpv = 0.0
-        # self.curvature_sv = 0.241900722
-        # self.curvature_lpv = 0.24335727
+            output_dir = os.path.join(os.path.dirname(os.path.abspath(mask_path)), 'vessel_features')
+            result = run_vessel_feature_pipeline(os.path.abspath(mask_path), output_dir)
+            model_features = result['model_features']
+            gui_fields = result['gui_fields']
+            errors = result.get('errors', {})
+            if errors:
+                details = '; '.join('label %s: %s' % item for item in sorted(errors.items()))
+                raise RuntimeError("Vascular feature extraction is incomplete: " + details)
+            invalid = [name for name in MODEL_FEATURES if not np.isfinite(model_features.get(name, np.nan))]
+            if invalid:
+                raise RuntimeError("Invalid vascular features: " + ', '.join(invalid))
 
-        self.area_pv = 194.7547515
-        self.area_sv = 122.1078435
-        self.area_lpv = 221.8448777
-        self.tortuosity_lpv = 0.0
-        self.curvature_sv = 0.211183025
-        self.curvature_lpv = 0.193013298
+            self.vasmask_path = os.path.abspath(mask_path)
+            self.vessel_features_output_dir = output_dir
+            self.vessel_model_features = {name: float(model_features[name]) for name in MODEL_FEATURES}
+            self.area_pv = float(gui_fields['area_pv'])
+            self.area_sv = float(gui_fields['area_sv'])
+            self.area_lpv = float(gui_fields['area_lpv'])
+            self.tortuosity_lpv = float(gui_fields['tortuosity_lpv'])
+            self.curvature_sv = float(gui_fields['curvature_sv'])
+            self.curvature_lpv = float(gui_fields['curvature_lpv'])
+        except Exception as exc:
+            self.vessel_model_features = None
+            self.statusbar.showMessage("Vascular feature extraction failed: %s" % exc)
+            QMessageBox.critical(self, "Vascular feature extraction failed", str(exc))
+            return False
 
         self.area_PV.setText(f"{self.area_pv:>.2f}")
         self.area_SV.setText(f"{self.area_sv:>.2f}")
@@ -920,6 +993,8 @@ class MyWindow1(QMainWindow, Ui_MainWindow):
         self.tortuosity_LPV.setText(f"{self.tortuosity_lpv:>.2f}")
         self.curvature_SV.setText(f"{self.curvature_sv:>.2f}")
         self.curvature_LPV.setText(f"{self.curvature_lpv:>.2f}")
+        self.statusbar.showMessage("Vascular features have been extracted")
+        return True
 
     def slideroriginal_function(self):
 
@@ -1211,10 +1286,11 @@ class MyWindow1(QMainWindow, Ui_MainWindow):
                                             filter="Image(*.nii *.nii.gz)")
         if len(fname[1]) != 0:
             img = itk.ReadImage(fname[0])
-            self.tumor_path = fname[0]
             mask = itk.GetArrayFromImage(img)
             if mask.shape == self.img.shape:
-                self.mask = itk.GetArrayFromImage(img)
+                self.vasmask_path = os.path.abspath(fname[0])
+                self.vasmask = mask
+                self.vessel_model_features = None
                 self.statusbar.showMessage("The segmentation result of vascular has been loaded")
             else:
                 self.statusbar.showMessage("Please load a correspronding segmentation result")
@@ -1312,6 +1388,9 @@ class MyWindow1(QMainWindow, Ui_MainWindow):
                                     QMessageBox.Yes)
             self.statusbar.showMessage("Predicting, please wait a moment.")
 
+            if self.vessel_model_features is None and not self.cal_vascular():
+                return
+
             clinical_features = {
                 'Age': [float(self.factor1)],
                 'Na.B': [float(self.factor2)],
@@ -1325,11 +1404,11 @@ class MyWindow1(QMainWindow, Ui_MainWindow):
                 'liver_median/spleen_median': [
                     self.liver_median / self.spleen_median if self.spleen_median != 0 else np.nan],
                 'VF_vol/Fat_vol': [self.VF_vol / self.Total_vol if self.Total_vol != 0 else np.nan],
-                'MIA_12': [self.area_pv / self.area_sv if self.area_sv != 0 else np.nan],
-                'maximum area_3': [self.area_lpv],
-                'tortuosity_3': [self.tortuosity_lpv],
-                'curvature_2': [self.curvature_sv],
-                'curvature_3': [self.curvature_lpv]
+                'MIA_12': [self.vessel_model_features['MIA_12']],
+                'maximum area_3': [self.vessel_model_features['maximum area_3']],
+                'tortuosity_3': [self.vessel_model_features['tortuosity_3']],
+                'curvature_2': [self.vessel_model_features['curvature_2']],
+                'curvature_3': [self.vessel_model_features['curvature_3']]
             }
 
 
